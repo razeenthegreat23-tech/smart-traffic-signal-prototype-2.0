@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Traffic Flow Optimizer</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#101827;color:#f4f7fb}
+h1{margin:0 0 6px;font-size:27px}
+.subtitle{color:#aab8ca;margin-bottom:16px}
+.panel{background:#1b2739;border:1px solid #34435a;border-radius:14px;padding:14px;margin-bottom:14px}
+.controls{display:flex;flex-wrap:wrap;gap:9px;align-items:center}
+button,select{padding:11px 14px;border:0;border-radius:8px;font-weight:bold;cursor:pointer;background:#30435e;color:white}
+.primary{background:#19a974}.stop{background:#d94b58}
+.status{margin-top:12px;font-weight:bold;color:#8de8b8}
+.canvas-wrap{width:100%;overflow:hidden;border-radius:12px;background:#b6d8a2}
+canvas{width:100%;height:auto;display:block}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.stat{padding:13px;background:#25354c;border-radius:10px}
+.stat span{display:block;color:#b9c7d9;font-size:13px;margin-bottom:7px}
+.stat strong{font-size:23px}
+.note{color:#c6d1df;line-height:1.5;font-size:14px}
+@media(min-width:700px){body{max-width:1050px;margin:auto}.stats{grid-template-columns:repeat(4,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+<h1>🚦 Traffic Flow Optimizer</h1>
+<div class="subtitle">Smart signals • Safer queues • Reduced waiting</div>
+
+<div class="panel">
+  <div class="controls">
+    <label for="mode">Signal mode:</label>
+    <select id="mode">
+      <option value="smart">Smart Mode</option>
+      <option value="fixed">Fixed Timer</option>
+    </select>
+    <button class="primary" id="startBtn">▶ Start</button>
+    <button class="stop" id="stopBtn">⏸ Pause</button>
+    <button id="resetBtn">↻ Reset</button>
+  </div>
+  <div class="status" id="status">Ready — press Start.</div>
+</div>
+
+<div class="panel canvas-wrap">
+  <canvas id="road" width="800" height="600"></canvas>
+</div>
+
+<div class="panel">
+  <h3>Live traffic statistics</h3>
+  <div class="stats">
+    <div class="stat"><span>Vehicles cleared</span><strong id="cleared">0</strong></div>
+    <div class="stat"><span>Waiting vehicles</span><strong id="waiting">16</strong></div>
+    <div class="stat"><span>Average wait</span><strong id="avgWait">0 s</strong></div>
+    <div class="stat"><span>Longest queue</span><strong id="queue">4 cars</strong></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>How it works</h3>
+  <p class="note"><b>Smart Mode:</b> prioritizes the road with more waiting cars and switches away from an empty road sooner. <b>Fixed Timer:</b> uses equal green durations. Yellow and all-red safety intervals are maintained.</p>
+  <p class="note">This is a visual prototype. Statistics are simulated and are not real-world traffic measurements.</p>
+</div>
+
+<script>
+const canvas=document.getElementById("road");
+const ctx=canvas.getContext("2d");
+const modeSelect=document.getElementById("mode");
+const statusEl=document.getElementById("status");
+
+const W=800,H=600;
+const CAR_GAP=58,CAR_SPEED=72;
+const GREEN_MIN=6,GREEN_MAX=14,FIXED_GREEN=9;
+const YELLOW_TIME=2,ALL_RED_TIME=1;
+
+let cars=[],running=false,lastFrame=0;
+let phase="green",phaseTime=0,activeGroup=0;
+let cleared=0,totalWait=0,waitSamples=0;
+let verticalGreen=FIXED_GREEN,horizontalGreen=FIXED_GREEN;
+
+const routes=[
+ {id:"N",group:0,x:375,y:-60,dx:0,dy:1,stop:305,end:680,color:"#3b82f6"},
+ {id:"S",group:0,x:425,y:660,dx:0,dy:-1,stop:305,end:680,color:"#f59e0b"},
+ {id:"W",group:1,x:-60,y:275,dx:1,dy:0,stop:405,end:860,color:"#a855f7"},
+ {id:"E",group:1,x:860,y:325,dx:-1,dy:0,stop:405,end:860,color:"#ef4444"}
+];
+
+function makeCars(){
+ cars=[];
+ for(const r of routes){
+  for(let i=0;i<4;i++){
+   cars.push({
+    route:r,
+    t:r.stop-25-i*CAR_GAP,
+    entered:false,
+    wait:0,
+    color:r.color
+   });
+  }
+ }
+}
+
+function reset(){
+ running=false;
+ lastFrame=0;
+ phase="green";
+ phaseTime=0;
+ activeGroup=0;
+ cleared=0;
+ totalWait=0;
+ waitSamples=0;
+ verticalGreen=FIXED_GREEN;
+ horizontalGreen=FIXED_GREEN;
+ makeCars();
+ updateStats();
+ statusEl.textContent="Ready — press Start.";
+ draw();
+}
+
+function drawRoad(){
+ ctx.fillStyle="#b6d8a2";
+ ctx.fillRect(0,0,W,H);
+ ctx.fillStyle="#9ca3af";
+ ctx.fillRect(315,0,170,H);
+ ctx.fillRect(0,215,W,170);
+ ctx.fillStyle="#4b5563";
+ ctx.fillRect(335,0,130,H);
+ ctx.fillRect(0,235,W,130);
+
+ ctx.strokeStyle="#e5e7eb";
+ ctx.lineWidth=2;
+ ctx.setLineDash([16,13]);
+ ctx.beginPath();
+ ctx.moveTo(400,0);ctx.lineTo(400,230);
+ ctx.moveTo(400,370);ctx.lineTo(400,H);
+ ctx.moveTo(0,300);ctx.lineTo(330,300);
+ ctx.moveTo(470,300);ctx.lineTo(W,300);
+ ctx.stroke();
+ ctx.setLineDash([]);
+
+ ctx.strokeStyle="#fff";
+ ctx.lineWidth=5;
+ ctx.beginPath();
+ ctx.moveTo(337,245);ctx.lineTo(395,245);
+ ctx.moveTo(405,355);ctx.lineTo(463,355);
+ ctx.moveTo(345,237);ctx.lineTo(345,295);
+ ctx.moveTo(455,305);ctx.lineTo(455,363);
+ ctx.stroke();
+
+ ctx.fillStyle="#d1d5db";
+ for(let i=0;i<6;i++){
+  ctx.fillRect(337+i*10,218,6,12);
+  ctx.fillRect(337+i*10,370,6,12);
+  ctx.fillRect(308,237+i*10,12,6);
+  ctx.fillRect(480,237+i*10,12,6);
+ }
+ ctx.fillStyle="#17351f";
+ ctx.font="bold 17px Arial";
+ ctx.fillText("NORTH",20,32);
+ ctx.fillText("SOUTH",20,575);
+ ctx.fillText("WEST",20,205);
+ ctx.fillText("EAST",710,205);
+}
+
+function drawSignal(x,y,group){
+ const green=phase==="green"&&activeGroup===group;
+ const yellow=phase==="yellow"&&activeGroup===group;
+ const red=!green&&!yellow;
+
+ ctx.fillStyle="#111827";
+ ctx.beginPath();
+ ctx.roundRect(x-12,y-30,24,70,7);
+ ctx.fill();
+
+ const lights=[
+  {y:y-19,c:red?"#ef4444":"#552222"},
+  {y:y,c:yellow?"#facc15":"#574b20"},
+  {y:y+19,c:green?"#22c55e":"#17472b"}
+ ];
+ for(const light of lights){
+  ctx.fillStyle=light.c;
+  ctx.beginPath();
+  ctx.arc(x,light.y,6,0,Math.PI*2);
+  ctx.fill();
+ }
+}
+
+function drawCar(car){
+ const r=car.route;
+ const x=r.x+r.dx*car.t;
+ const y=r.y+r.dy*car.t;
+ ctx.save();
+ ctx.translate(x,y);
+ ctx.fillStyle=car.color;
+
+ if(r.dx!==0){
+  ctx.beginPath();
+  ctx.roundRect(-17,-9,34,18,5);
+  ctx.fill();
+  ctx.fillStyle="#dbeafe";
+  ctx.fillRect(2,-6,8,12);
+  ctx.fillStyle="#111827";
+  ctx.fillRect(-12,-11,7,3);
+  ctx.fillRect(6,-11,7,3);
+  ctx.fillRect(-12,8,7,3);
+  ctx.fillRect(6,8,7,3);
+ }else{
+  ctx.beginPath();
+  ctx.roundRect(-9,-17,18,34,5);
+  ctx.fill();
+  ctx.fillStyle="#dbeafe";
+  ctx.fillRect(-6,-8,12,8);
+  ctx.fillStyle="#111827";
+  ctx.fillRect(-11,-12,3,7);
+  ctx.fillRect(8,-12,3,7);
+  ctx.fillRect(-11,6,3,7);
+  ctx.fillRect(8,6,3,7);
+ }
+ ctx.restore();
+}
+
+function draw(){
+ drawRoad();
+ drawSignal(305,195,0);
+ drawSignal(495,395,0);
+ drawSignal(290,395,1);
+ drawSignal(510,195,1);
+
+ for(const car of cars){
+  const r=car.route;
+  const x=r.x+r.dx*car.t;
+  const y=r.y+r.dy*car.t;
+  if(x>-50&&x<W+50&&y>-50&&y<H+50)drawCar(car);
+ }
+
+ ctx.fillStyle="#fff";
+ ctx.font="bold 13px Arial";
+ ctx.fillText(
+  phase==="green"?"GREEN":phase==="yellow"?"YELLOW":"ALL RED",
+  345,405
+ );
+}
+
+function groupQueue(group){
+ return cars.filter(c=>
+  c.route.group===group&&
+  !c.entered&&
+  c.t<c.route.stop&&
+  c.t>c.route.stop-220
+ ).length;
+}
+
+function chooseGreenDuration(group){
+ if(modeSelect.value==="fixed")return FIXED_GREEN;
+ return Math.max(
+  GREEN_MIN,
+  Math.min(GREEN_MAX,GREEN_MIN+groupQueue(group)*1.5)
+ );
+}
+
+function beginGreen(group){
+ if(modeSelect.value==="smart"){
+  const v=groupQueue(0);
+  const h=groupQueue(1);
+  if(v>h)group=0;
+  else if(h>v)group=1;
+ }
+ activeGroup=group;
+ phase="green";
+ phaseTime=0;
+ if(group===0)verticalGreen=chooseGreenDuration(0);
+ else horizontalGreen=chooseGreenDuration(1);
+}
+
+function advanceSignal(dt){
+ phaseTime+=dt;
+ if(phase==="green"){
+  const other=1-activeGroup;
+  const currentQueue=groupQueue(activeGroup);
+  const otherQueue=groupQueue(other);
+
+  if(modeSelect.value==="smart"&&currentQueue===0&&otherQueue>0){
+   phase="yellow";
+   phaseTime=0;
+   return;
+  }
+
+  const duration=activeGroup===0?verticalGreen:horizontalGreen;
+  if(phaseTime>=duration){
+   phase="yellow";
+   phaseTime=0;
+  }
+ }else if(phase==="yellow"&&phaseTime>=YELLOW_TIME){
+  phase="allred";
+  phaseTime=0;
+ }else if(phase==="allred"&&phaseTime>=ALL_RED_TIME){
+  beginGreen(1-activeGroup);
+ }
+}
+
+function isGreen(car){
+ return phase==="green"&&activeGroup===car.route.group;
+}
+
+function updateCars(dt){
+ for(const r of routes){
+  // Front car first, followed by each car behind it.
+  const lane=cars
+   .filter(c=>c.route.id===r.id)
+   .sort((a,b)=>b.t-a.t);
+
+  let frontPosition=Infinity;
+
+  for(const car of lane){
+   let speed=CAR_SPEED;
+   const gap=frontPosition===Infinity?Infinity:frontPosition-car.t;
+
+   // First calculate safe following speed.
+   if(gap<CAR_GAP){
+    speed=Math.max(0,Math.min(CAR_SPEED,(gap-CAR_GAP+12)*3));
+   }
+
+   if(!car.entered){
+    if(car.t>=r.stop){
+     if(isGreen(car)){
+      car.entered=true;
+     }else{
+      car.t=r.stop-1;
+      speed=0;
+     }
+    }else if(!isGreen(car)){
+     // Approach the stop line, but never pass it on red/yellow.
+     speed=Math.min(speed,Math.max(0,r.stop-car.t-1)*4);
+    }
+   }
+
+   if(car.entered){
+    // Keep moving through the junction even after the light changes.
+    // A small minimum speed avoids a permanent deadlock.
+    speed=CAR_SPEED;
+    if(gap<CAR_GAP){
+     speed=Math.max(8,Math.min(CAR_SPEED,(gap-CAR_GAP+12)*3));
+    }
+   }
+
+   if(speed<10&&!car.entered)car.wait+=dt;
+
+   car.t+=speed*dt;
+
+   // Count and recycle only after the car has exited the road.
+   if(car.t>r.end){
+    cleared++;
+    totalWait+=car.wait;
+    waitSamples++;
+    car.wait=0;
+    car.entered=false;
+    car.t=-260-Math.random()*120;
+   }
+
+   frontPosition=car.t;
+  }
+ }
+}
+
+function updateStats(){
+ const waiting=cars.filter(c=>
+  !c.entered&&
+  c.t>=c.route.stop-220&&
+  c.t<c.route.stop
+ ).length;
+
+ const longest=Math.max(groupQueue(0),groupQueue(1));
+
+ document.getElementById("cleared").textContent=cleared;
+ document.getElementById("waiting").textContent=waiting;
+ document.getElementById("avgWait").textContent=
+  (waitSamples?totalWait/waitSamples:0).toFixed(1)+" s";
+ document.getElementById("queue").textContent=longest+" cars";
+
+ if(running){
+  statusEl.textContent=
+   (modeSelect.value==="smart"?"SMART MODE":"FIXED TIMER")+
+   " • "+phase.toUpperCase()+" • "+
+   (activeGroup===0?"NORTH/SOUTH":"EAST/WEST");
+ }
+}
+
+function frame(now){
+ if(!running)return;
+ if(!lastFrame)lastFrame=now;
+ const dt=Math.min((now-lastFrame)/1000,0.04);
+ lastFrame=now;
+
+ advanceSignal(dt);
+ updateCars(dt);
+ draw();
+ updateStats();
+ requestAnimationFrame(frame);
+}
+
+document.getElementById("startBtn").addEventListener("click",()=>{
+ if(running)return;
+ running=true;
+ lastFrame=0;
+ statusEl.textContent="Simulation running.";
+ requestAnimationFrame(frame);
+});
+
+document.getElementById("stopBtn").addEventListener("click",()=>{
+ running=false;
+ statusEl.textContent="Paused.";
+ draw();
+});
+
+document.getElementById("resetBtn").addEventListener("click",reset);
+
+modeSelect.addEventListener("change",()=>{
+ statusEl.textContent="Mode changed to "+
+  (modeSelect.value==="smart"?"Smart Mode.":"Fixed Timer.");
+});
+
+reset();
+</script>
+</body>
+</html>
